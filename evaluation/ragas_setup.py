@@ -504,15 +504,34 @@ class RAGEvaluatorHF:
             
             # Handle numpy types and ensure JSON serializable
             def convert_types(obj):
-                if hasattr(obj, 'item'):  # numpy types
+                import numpy as np
+                
+                # Handle numpy scalar types
+                if isinstance(obj, (np.integer, np.floating, np.bool_)):
                     return obj.item()
-                elif isinstance(obj, (list, dict)):
-                    if isinstance(obj, list):
-                        return [convert_types(item) for item in obj]
+                elif isinstance(obj, np.ndarray):
+                    if obj.size == 1:
+                        return obj.item()
                     else:
-                        return {key: convert_types(value) for key, value in obj.items()}
-                else:
+                        return obj.tolist()
+                elif hasattr(obj, 'item') and callable(obj.item):
+                    try:
+                        return obj.item()
+                    except (ValueError, TypeError):
+                        # If item() fails, try converting to native Python type
+                        if hasattr(obj, 'tolist'):
+                            return obj.tolist()
+                        else:
+                            return str(obj)
+                elif isinstance(obj, list):
+                    return [convert_types(item) for item in obj]
+                elif isinstance(obj, dict):
+                    return {key: convert_types(value) for key, value in obj.items()}
+                elif isinstance(obj, (int, float, str, bool, type(None))):
                     return obj
+                else:
+                    # For any other type, try to convert to string
+                    return str(obj)
             
             # Convert all values to JSON serializable types
             serializable_results = convert_types(results)
@@ -521,10 +540,47 @@ class RAGEvaluatorHF:
                 json.dump(serializable_results, file, indent=2, ensure_ascii=False)
             
             print(f"✅ Results saved to {output_file}")
+            print(f"📄 File contains {len(serializable_results)} records")
             
         except Exception as e:
             print(f"❌ Error saving results: {e}")
-            raise
+            print("🔧 Attempting alternative save method...")
+            
+            # Alternative method: save without complex type conversion
+            try:
+                # Create a simpler version of the data
+                simple_results = []
+                for idx, row in df.iterrows():
+                    simple_row = {}
+                    for col in df.columns:
+                        value = row[col]
+                        if isinstance(value, dict):
+                            # Handle metric dictionaries
+                            simple_row[col] = {k: float(v) if hasattr(v, 'item') else v for k, v in value.items()}
+                        elif isinstance(value, list):
+                            # Handle lists
+                            simple_row[col] = [str(item) if not isinstance(item, (int, float, str, bool, type(None))) else item for item in value]
+                        else:
+                            # Handle other types
+                            if hasattr(value, 'item'):
+                                simple_row[col] = float(value.item()) if hasattr(value, 'dtype') else str(value)
+                            else:
+                                simple_row[col] = value
+                    simple_results.append(simple_row)
+                
+                with open(output_file, 'w', encoding='utf-8') as file:
+                    json.dump(simple_results, file, indent=2, ensure_ascii=False)
+                
+                print(f"✅ Results saved using alternative method to {output_file}")
+                print(f"📄 File contains {len(simple_results)} records")
+                
+            except Exception as e2:
+                print(f"❌ Alternative save method also failed: {e2}")
+                # Save as CSV as last resort
+                csv_file = output_file.replace('.json', '.csv')
+                df.to_csv(csv_file, index=False)
+                print(f"📄 Saved as CSV instead: {csv_file}")
+                raise
     
     def push_to_huggingface(self, df: pd.DataFrame, dataset_name: str):
         """
