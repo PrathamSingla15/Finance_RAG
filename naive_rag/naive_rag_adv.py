@@ -4,21 +4,24 @@ import argparse
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 import glob
+import pickle
 
 import openai
 import numpy as np
 import pandas as pd
 import faiss
-from sentence_transformers import CrossEncoder
+import torch
+from transformers import AutoTokenizer, AutoModel
+from FlagEmbedding import FlagReranker
 from tqdm.auto import tqdm
 import PyPDF2
 from datasets import Dataset, load_dataset
 from huggingface_hub import HfApi
 
 # Configuration constants
-DEFAULT_MODEL = "gpt-5-mini-2025-08-07"
-EMBEDDING_MODEL = "text-embedding-3-small"
-CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
+EMBEDDING_MODEL = "BAAI/bge-m3"
+CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-base'
 
 def extract_text_from_pdf(pdf_file_path):
     """Extract text from a PDF file."""
@@ -126,34 +129,132 @@ def process_pdf_directory(pdf_directory: str) -> List[Dict[str, str]]:
 class VectorStore:
     """Handles vector embeddings and FAISS index operations."""
 
-    def __init__(self, embedding_model: str = EMBEDDING_MODEL, openai_client=None):
-        self.embedding_model = embedding_model
+    def __init__(self, embedding_model: str = EMBEDDING_MODEL, embeddings_dir: str = "embeddings"):
+        self.embedding_model_name = embedding_model
+        self.embeddings_dir = Path(embeddings_dir)
+        self.embeddings_dir.mkdir(exist_ok=True)
+        
+        # Load embedding model and tokenizer
+        print(f"Loading embedding model: {embedding_model}")
+        self.tokenizer = AutoTokenizer.from_pretrained(embedding_model)
+        self.model = AutoModel.from_pretrained(embedding_model, torch_dtype=torch.float32)
+        
+        # Set device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        self.model.eval()
+        
         self.index = None
         self.chunks = None
-        self.client = openai_client
+        
+        print(f"Embedding model loaded on device: {self.device}")
 
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Get embeddings for a list of texts with batch processing."""
         all_embeddings = []
-        batch_size = 100
-
-        for i in tqdm(range(0, len(texts), batch_size), desc="Creating embeddings"):
-            batch = texts[i:i + batch_size]
-            try:
-                response = self.client.embeddings.create(input=batch, model=self.embedding_model)
-                batch_embeddings = [item.embedding for item in response.data]
-                all_embeddings.extend(batch_embeddings)
-            except Exception as e:
-                print(f"Error processing batch {i//batch_size + 1}: {e}")
-                for text in batch:
-                    try:
-                        response = self.client.embeddings.create(input=[text], model=self.embedding_model)
-                        all_embeddings.append(response.data[0].embedding)
-                    except Exception as individual_error:
-                        print(f"Skipping problematic text: {individual_error}")
-                        all_embeddings.append([0.0] * 1536)
+        batch_size = 32  # Reduced batch size for BGE-M3
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, len(texts), batch_size), desc="Creating embeddings"):
+                batch = texts[i:i + batch_size]
+                
+                try:
+                    # Tokenize batch
+                    encoded_input = self.tokenizer(
+                        batch, 
+                        padding=True, 
+                        truncation=True, 
+                        return_tensors='pt',
+                        max_length=8192  # BGE-M3 max length
+                    )
+                    
+                    # Move to device
+                    encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
+                    
+                    # Get embeddings
+                    model_output = self.model(**encoded_input)
+                    
+                    # Pool embeddings (mean pooling)
+                    token_embeddings = model_output[0]
+                    attention_mask = encoded_input['attention_mask']
+                    
+                    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                    embeddings = sum_embeddings / sum_mask
+                    
+                    # Normalize embeddings
+                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                    
+                    batch_embeddings = embeddings.cpu().numpy().tolist()
+                    all_embeddings.extend(batch_embeddings)
+                    
+                except Exception as e:
+                    print(f"Error processing batch {i//batch_size + 1}: {e}")
+                    # Fallback: process individually
+                    for text in batch:
+                        try:
+                            encoded_input = self.tokenizer(
+                                [text], 
+                                padding=True, 
+                                truncation=True, 
+                                return_tensors='pt',
+                                max_length=8192
+                            )
+                            encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
+                            
+                            model_output = self.model(**encoded_input)
+                            token_embeddings = model_output[0]
+                            attention_mask = encoded_input['attention_mask']
+                            
+                            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                            embedding = sum_embeddings / sum_mask
+                            embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+                            
+                            all_embeddings.append(embedding.cpu().numpy().tolist()[0])
+                        except Exception as individual_error:
+                            print(f"Skipping problematic text: {individual_error}")
+                            # Create zero embedding with correct dimensions
+                            all_embeddings.append([0.0] * 1024)  # BGE-M3 embedding dimension
 
         return all_embeddings
+
+    def save_embeddings(self, chunks: List[Dict[str, str]], embeddings: List[List[float]]):
+        """Save chunks and embeddings to disk."""
+        embeddings_file = self.embeddings_dir / "embeddings.pkl"
+        chunks_file = self.embeddings_dir / "chunks.pkl"
+        
+        with open(embeddings_file, 'wb') as f:
+            pickle.dump(embeddings, f)
+        
+        with open(chunks_file, 'wb') as f:
+            pickle.dump(chunks, f)
+        
+        print(f"Embeddings and chunks saved to {self.embeddings_dir}")
+
+    def load_embeddings(self) -> Tuple[Optional[List[Dict[str, str]]], Optional[List[List[float]]]]:
+        """Load chunks and embeddings from disk."""
+        embeddings_file = self.embeddings_dir / "embeddings.pkl"
+        chunks_file = self.embeddings_dir / "chunks.pkl"
+        
+        if embeddings_file.exists() and chunks_file.exists():
+            try:
+                with open(embeddings_file, 'rb') as f:
+                    embeddings = pickle.load(f)
+                
+                with open(chunks_file, 'rb') as f:
+                    chunks = pickle.load(f)
+                
+                print(f"Loaded {len(chunks)} chunks and embeddings from {self.embeddings_dir}")
+                return chunks, embeddings
+            except Exception as e:
+                print(f"Error loading embeddings: {e}")
+                return None, None
+        else:
+            print("No existing embeddings found.")
+            return None, None
 
     def create_index(self, chunks: List[Dict[str, str]]) -> Optional[faiss.Index]:
         """Create a FAISS vector store from document chunks."""
@@ -161,14 +262,36 @@ class VectorStore:
             print("No chunks were provided to create a vector store.")
             return None
 
-        self.chunks = chunks
-        chunk_contents = [chunk["content"] for chunk in chunks]
+        # Try to load existing embeddings
+        loaded_chunks, loaded_embeddings = self.load_embeddings()
+        
+        if loaded_chunks is not None and loaded_embeddings is not None:
+            # Check if chunks match (simple comparison by length and first chunk content)
+            if (len(loaded_chunks) == len(chunks) and 
+                len(loaded_chunks) > 0 and len(chunks) > 0 and
+                loaded_chunks[0]['content'] == chunks[0]['content']):
+                
+                print("Using existing embeddings.")
+                self.chunks = loaded_chunks
+                embeddings = loaded_embeddings
+            else:
+                print("Chunks have changed. Regenerating embeddings.")
+                self.chunks = chunks
+                chunk_contents = [chunk["content"] for chunk in chunks]
+                embeddings = self.get_embeddings(chunk_contents)
+                self.save_embeddings(chunks, embeddings)
+        else:
+            print("Generating new embeddings.")
+            self.chunks = chunks
+            chunk_contents = [chunk["content"] for chunk in chunks]
+            embeddings = self.get_embeddings(chunk_contents)
+            self.save_embeddings(chunks, embeddings)
 
         try:
-            embeddings = self.get_embeddings(chunk_contents)
             embedding_matrix = np.array(embeddings).astype("float32")
-
-            self.index = faiss.IndexFlatL2(embedding_matrix.shape[1])
+            
+            # Use inner product (cosine similarity) for normalized embeddings
+            self.index = faiss.IndexFlatIP(embedding_matrix.shape[1])
             self.index.add(embedding_matrix)
 
             print("FAISS index created successfully.")
@@ -184,7 +307,9 @@ class RetrievalSystem:
 
     def __init__(self, vector_store: VectorStore, cross_encoder_model: str = CROSS_ENCODER_MODEL):
         self.vector_store = vector_store
-        self.cross_encoder = CrossEncoder(cross_encoder_model)
+        print(f"Loading reranker model: {cross_encoder_model}")
+        self.reranker = FlagReranker(cross_encoder_model, use_fp16=False)
+        print("Reranker model loaded successfully.")
 
     def retrieve_and_rerank(self, query: str, k_initial: int = 10, k_final: int = 3) -> List[Dict[str, str]]:
         """Retrieve documents and re-rank them using cross-encoder."""
@@ -196,8 +321,14 @@ class RetrievalSystem:
         distances, indices = self.vector_store.index.search(query_embedding, k_initial)
 
         initial_candidates = [self.vector_store.chunks[i] for i in indices[0]]
+        
+        # Prepare pairs for reranking
         pairs = [[query, candidate["content"]] for candidate in initial_candidates]
-        scores = self.cross_encoder.predict(pairs)
+        scores = self.reranker.compute_score(pairs)
+        
+        # Handle both single score and list of scores
+        if not isinstance(scores, list):
+            scores = [scores]
 
         scored_candidates = list(zip(scores, initial_candidates))
         scored_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -214,12 +345,13 @@ class QueryExpander:
 
     def expand_query(self, query: str) -> List[str]:
         """Generate alternative phrasings of the original question."""
-        prompt = f"""
-        You are a helpful assistant who is an expert in finance and accounting.
+        
+        system_prompt = """You are a helpful assistant who is an expert in finance and accounting.
         Your task is to generate 3 alternative questions that are semantically similar to the original question.
-        The questions should be phrased differently to maximize the chance of matching relevant documents.
+        The questions should be phrased differently to maximize the chance of matching relevant documents."""
 
-        Original question: "{query}"
+        prompt = f"""
+        Original question: {query}
 
         Provide the 3 alternative questions, each on a new line.
         """
@@ -227,10 +359,11 @@ class QueryExpander:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=1,
+            temperature=0.7,
+            top_p=0.95,
         )
 
         expanded_queries = response.choices[0].message.content.strip().split("\n")
@@ -263,8 +396,13 @@ class RAGPipeline:
         if not unique_chunks:
             return "I could not find any relevant information to answer your question.", []
         
+        # Final reranking with original query
         final_rerank_pairs = [[query, chunk["content"]] for chunk in unique_chunks]
-        final_scores = self.retrieval_system.cross_encoder.predict(final_rerank_pairs)
+        final_scores = self.retrieval_system.reranker.compute_score(final_rerank_pairs)
+        
+        # Handle both single score and list of scores
+        if not isinstance(final_scores, list):
+            final_scores = [final_scores]
 
         scored_final_chunks = list(zip(final_scores, unique_chunks))
         scored_final_chunks.sort(key=lambda x: x[0], reverse=True)
@@ -273,11 +411,11 @@ class RAGPipeline:
 
         context_str = "\n\n---\n\n".join([f"Source ({chunk['doc_name']}):\n{chunk['content']}" for chunk in top_chunks])
 
-        prompt = f"""
-        You are a financial analyst assistant. Answer the user's question based *only* on the provided context.
+        system_prompt = """You are a financial analyst assistant. Answer the user's question based *only* on the provided context.
         Be concise and to the point. If the answer is not available in the context, say so.
-        Cite the source document for each piece of information you use.
+        Cite the source document for each piece of information you use."""
 
+        prompt = f"""
         Context:
         {context_str}
 
@@ -289,10 +427,11 @@ class RAGPipeline:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "You are a helpful financial analyst."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=1,
+            temperature=0.7,
+            top_p=0.95,
         )
 
         return response.choices[0].message.content, top_chunks
@@ -360,20 +499,21 @@ def upload_to_huggingface(results: List[Dict], dataset_name: str, hf_token: str)
 
 def main():
     parser = argparse.ArgumentParser(description="RAG System for FinanceBench Dataset")
-    parser.add_argument("--pdf_directory", type=str, required=True, help="Path to directory containing PDF files")
-    parser.add_argument("--openai_api_key", type=str, required=True, help="OpenAI API key")
+    parser.add_argument("--data", type=str, required=True, help="Path to directory containing PDF files")
+    parser.add_argument("--openai_key", type=str, required=True, help="OpenAI API key")
     parser.add_argument("--hf_token", type=str, required=True, help="Hugging Face token")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to process (-1 for all)")
     parser.add_argument("--output_file", type=str, default="rag_results.json", help="Output JSON file path")
-    parser.add_argument("--hf_dataset_name", type=str, required=True, help="Hugging Face dataset name to upload")
+    parser.add_argument("--hf_dataset", type=str, required=True, help="Hugging Face dataset name to upload")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="OpenAI model to use")
     parser.add_argument("--embedding_model", type=str, default=EMBEDDING_MODEL, help="Embedding model to use")
     parser.add_argument("--cross_encoder_model", type=str, default=CROSS_ENCODER_MODEL, help="Cross-encoder model for re-ranking")
+    parser.add_argument("--embeddings_dir", type=str, default="embeddings", help="Directory to store/load embeddings")
     
     args = parser.parse_args()
     
     # Setup OpenAI client
-    client = openai.OpenAI(api_key=args.openai_api_key)
+    client = openai.OpenAI(api_key=args.openai_key)
     
     # Load dataset
     print("Loading FinanceBench dataset...")
@@ -382,11 +522,11 @@ def main():
     
     # Process PDFs
     print("Processing PDF documents...")
-    chunks = process_pdf_directory(args.pdf_directory)
+    chunks = process_pdf_directory(args.data)
     
     # Initialize RAG components
     print("Initializing RAG system...")
-    vector_store = VectorStore(embedding_model=args.embedding_model, openai_client=client)
+    vector_store = VectorStore(embedding_model=args.embedding_model, embeddings_dir=args.embeddings_dir)
     index = vector_store.create_index(chunks)
     
     if index is None:
